@@ -3,12 +3,45 @@ import joblib
 import numpy as np
 import shap
 import pandas as pd
+import os
+
+from src.features import compute_elo_ratings, engineer_match_features
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 MODEL_PATH = "models/ensemble_latest.pkl"
 
-@st.cache_resource
-def load_model(path):
-    return joblib.load(path)
+@st.cache_resource(show_spinner=True)
+def load_or_train_model():
+    if os.path.exists(MODEL_PATH):
+        try:
+            return joblib.load(MODEL_PATH)
+        except Exception:
+            st.warning("Failed to load existing model; retraining fallback.")
+    sample_path = "data/sample_matches.csv"
+    if not os.path.exists(sample_path):
+        st.error("No model and no sample data to train fallback.")
+        st.stop()
+
+    df_raw = pd.read_csv(sample_path, parse_dates=["date"])
+    elo_df = compute_elo_ratings(df_raw)
+    feat_df = engineer_match_features(elo_df)
+    X = feat_df[["elo_diff", "home_implied", "draw_implied", "away_implied"]]
+    y = feat_df["target_home_win"]
+
+    tscv = TimeSeriesSplit(n_splits=2)
+    base = GradientBoostingClassifier()
+    calibrated = CalibratedClassifierCV(base, cv=tscv, method="isotonic")
+    calibrated.fit(X, y)
+
+    try:
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(calibrated, MODEL_PATH)
+    except Exception:
+        pass
+
+    return calibrated
 
 def compute_implied_probs(home_odds, draw_odds, away_odds):
     home_implied = 1 / home_odds
@@ -30,6 +63,7 @@ def make_feature_vector(home_elo, away_elo, home_odds, draw_odds, away_odds):
 def main():
     st.set_page_config(page_title="Sports Predictor", layout="centered")
     st.title("🏟️ Sports Match Outcome Predictor")
+
     st.sidebar.header("Inputs")
     home_elo = st.sidebar.number_input("Home team Elo", value=1500.0)
     away_elo = st.sidebar.number_input("Away team Elo", value=1500.0)
@@ -37,7 +71,7 @@ def main():
     draw_odds = st.sidebar.number_input("Draw odds", value=3.5)
     away_odds = st.sidebar.number_input("Away odds", value=4.0)
 
-    model = load_model(MODEL_PATH)
+    model = load_or_train_model()
     features_array, raw_feats = make_feature_vector(home_elo, away_elo, home_odds, draw_odds, away_odds)
     prob_home_win = model.predict_proba(features_array)[0][1]
 
